@@ -44,7 +44,8 @@ export function CanvasWorkspace() {
   const canvasRef = useRef<HTMLCanvasElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const simulationEngineRef = useRef<SimulationEngine | null>(null)
-  const animationFrameRef = useRef<number>()
+  const animationFrameRef = useRef<number | undefined>(undefined)
+  const lastDrawTimeRef = useRef<number>(0)
 
   const {
     activeScenario,
@@ -86,7 +87,10 @@ export function CanvasWorkspace() {
   // Initialize simulation engine
   useEffect(() => {
     if (activeScenario) {
-      simulationEngineRef.current = new SimulationEngine(activeScenario, setSimulationState)
+      simulationEngineRef.current = new SimulationEngine(activeScenario, (newState) => {
+        setSimulationState(newState)
+        // Don't call draw() here to avoid circular dependency
+      })
     }
     return () => {
       if (animationFrameRef.current) {
@@ -95,35 +99,6 @@ export function CanvasWorkspace() {
     }
   }, [activeScenario])
 
-  // Animation loop
-  useEffect(() => {
-    if (isSimulating && simulationEngineRef.current) {
-      let lastTime = Date.now()
-
-      const animate = () => {
-        const currentTime = Date.now()
-        const deltaTime = currentTime - lastTime
-        lastTime = currentTime
-
-        simulationEngineRef.current?.step(deltaTime)
-        setSimulationTime(simulationEngineRef.current?.getState().time || 0)
-
-        animationFrameRef.current = requestAnimationFrame(animate)
-      }
-
-      animationFrameRef.current = requestAnimationFrame(animate)
-    } else {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current)
-      }
-    }
-
-    return () => {
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current)
-      }
-    }
-  }, [isSimulating, setSimulationTime])
 
   // Handle simulation controls
   const handlePlayPause = () => {
@@ -133,8 +108,13 @@ export function CanvasWorkspace() {
       simulationEngineRef.current.pause()
       setIsSimulating(false)
     } else {
-      simulationEngineRef.current.start()
-      setIsSimulating(true)
+      try {
+        simulationEngineRef.current.start()
+        setIsSimulating(true)
+      } catch (error) {
+        console.error('Failed to start simulation:', error)
+        // Don't set isSimulating to true if start failed
+      }
     }
   }
 
@@ -266,7 +246,7 @@ export function CanvasWorkspace() {
 
   const drawRobot = useCallback(
     (ctx: CanvasRenderingContext2D, robot: any) => {
-      const { position, status, batteryLevel, robotType } = robot
+      const { position, status, batteryLevel, robotType, isPaused, reachedDestination, pathIndex, path } = robot
 
       // Robot colors by status
       const statusColors = {
@@ -276,22 +256,62 @@ export function CanvasWorkspace() {
         charging: "#10b981",
       }
 
-      // Draw robot body
-      ctx.fillStyle = statusColors[status] || "#6b7280"
+      // Draw robot body with different colors based on state
+      if (isPaused) {
+        ctx.fillStyle = "#ef4444" // Red when paused
+      } else if (reachedDestination) {
+        ctx.fillStyle = "#10b981" // Green when finished
+      } else {
+        ctx.fillStyle = statusColors[status as keyof typeof statusColors] || "#6b7280"
+      }
+      
       ctx.strokeStyle = "#374151"
       ctx.lineWidth = 2 / zoom
 
-      const robotSize = 15
+      const robotSize = robot.radius || 15
       ctx.beginPath()
       ctx.arc(position.x, position.y, robotSize, 0, 2 * Math.PI)
       ctx.fill()
       ctx.stroke()
 
-      // Draw robot direction indicator
-      ctx.fillStyle = "white"
-      ctx.beginPath()
-      ctx.arc(position.x + robotSize * 0.3, position.y, 3, 0, 2 * Math.PI)
-      ctx.fill()
+      // Draw collision detection radius when paused
+      if (isPaused) {
+        ctx.fillStyle = "rgba(239, 68, 68, 0.2)"
+        ctx.strokeStyle = "transparent"
+        ctx.lineWidth = 0
+        ctx.beginPath()
+        ctx.arc(position.x, position.y, (robotSize + 20) * 2, 0, 2 * Math.PI)
+        ctx.fill()
+      }
+
+      // Draw direction indicator (only if not paused and not finished)
+      if (!isPaused && !reachedDestination && pathIndex < path.length) {
+        const target = path[pathIndex]
+        if (target) {
+          const direction = {
+            x: target.x - position.x,
+            y: target.y - position.y
+          }
+          const magnitude = Math.sqrt(direction.x * direction.x + direction.y * direction.y)
+          if (magnitude > 0) {
+            const normalizedDirection = {
+              x: direction.x / magnitude,
+              y: direction.y / magnitude
+            }
+            const arrowEnd = {
+              x: position.x + normalizedDirection.x * (robotSize + 5),
+              y: position.y + normalizedDirection.y * (robotSize + 5)
+            }
+            
+            ctx.strokeStyle = "#fbbf24"
+            ctx.lineWidth = 3 / zoom
+            ctx.beginPath()
+            ctx.moveTo(position.x, position.y)
+            ctx.lineTo(arrowEnd.x, arrowEnd.y)
+            ctx.stroke()
+          }
+        }
+      }
 
       // Draw battery indicator
       const batteryWidth = 20
@@ -311,25 +331,43 @@ export function CanvasWorkspace() {
       ctx.font = `${10 / zoom}px sans-serif`
       ctx.textAlign = "center"
       ctx.fillText(robot.id.slice(-1), position.x, position.y + robotSize + 15)
+
+      // Draw pause indicator
+      if (isPaused) {
+        ctx.fillStyle = "#ef4444"
+        ctx.font = `${8 / zoom}px sans-serif`
+        ctx.textAlign = "center"
+        ctx.fillText('PAUSED', position.x, position.y - robotSize - 10)
+      }
     },
     [zoom],
   )
 
   const drawRobotPath = useCallback(
     (ctx: CanvasRenderingContext2D, robot: any) => {
-      if (!robot.path || robot.path.length < 2) return
+      // Only draw path for robots that are moving and have a valid path
+      if (!robot.path || robot.path.length < 2 || robot.status !== "moving" || robot.reachedDestination) return
 
-      ctx.strokeStyle = "#3b82f6"
+      // Draw the path as a faint line
+      ctx.strokeStyle = "rgba(59, 130, 246, 0.6)"
       ctx.lineWidth = 2 / zoom
       ctx.setLineDash([5, 5])
 
       ctx.beginPath()
-      ctx.moveTo(robot.path[0].x, robot.path[0].y)
-      for (let i = 1; i < robot.path.length; i++) {
+      ctx.moveTo(robot.position.x, robot.position.y)
+      for (let i = robot.pathIndex; i < robot.path.length; i++) {
         ctx.lineTo(robot.path[i].x, robot.path[i].y)
       }
       ctx.stroke()
       ctx.setLineDash([])
+
+      // Draw waypoints as small circles
+      ctx.fillStyle = "rgba(59, 130, 246, 0.8)"
+      for (let i = robot.pathIndex; i < robot.path.length; i++) {
+        ctx.beginPath()
+        ctx.arc(robot.path[i].x, robot.path[i].y, 3 / zoom, 0, 2 * Math.PI)
+        ctx.fill()
+      }
     },
     [zoom],
   )
@@ -381,10 +419,58 @@ export function CanvasWorkspace() {
     simulationState,
   ])
 
-  // Redraw canvas when dependencies change
+  // Redraw canvas when dependencies change (but not during simulation)
   useEffect(() => {
-    draw()
-  }, [draw])
+    if (!isSimulating) {
+      draw()
+    }
+  }, [draw, isSimulating])
+
+  // Animation loop
+  useEffect(() => {
+    if (isSimulating && simulationEngineRef.current) {
+      let lastTime = Date.now()
+
+      const animate = () => {
+        try {
+          const currentTime = Date.now()
+          const deltaTime = currentTime - lastTime
+          lastTime = currentTime
+
+          simulationEngineRef.current?.step(deltaTime)
+          setSimulationTime(simulationEngineRef.current?.getState().time || 0)
+
+          // Force canvas redraw (throttled to 60fps)
+          const timeSinceLastDraw = currentTime - lastDrawTimeRef.current
+          if (timeSinceLastDraw >= 16) { // ~60fps
+            draw()
+            lastDrawTimeRef.current = currentTime
+          }
+
+          animationFrameRef.current = requestAnimationFrame(animate)
+        } catch (error) {
+          console.error('Error in animation loop:', error)
+          // Stop simulation on error
+          setIsSimulating(false)
+          if (simulationEngineRef.current) {
+            simulationEngineRef.current.pause()
+          }
+        }
+      }
+
+      animationFrameRef.current = requestAnimationFrame(animate)
+    } else {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+      }
+    }
+
+    return () => {
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current)
+      }
+    }
+  }, [isSimulating, setSimulationTime, draw])
 
   // Handle canvas resize
   useEffect(() => {
